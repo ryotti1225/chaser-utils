@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ================================================================
     println!();
     println!("=== Map view ===");
-    match fetch_map_view("cool33", "cool", MapViewOptions::default()).await {
+    match fetch_map_view("cool21", "cool", MapViewOptions::default()).await {
         Err(e) => println!("  fetch failed: {}", e),
         Ok(mv) => {
             // Basic info
