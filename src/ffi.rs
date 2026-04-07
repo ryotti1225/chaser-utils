@@ -1,39 +1,53 @@
 //! C FFI layer
 //!
 //! Exposes the scraper API as a C-compatible interface.
-//! C++ users include `scraper.h` and link against `scraper.dll` / `libscraper.so`.
+//! C++ users include `chaser-util.h` and link against `chaser_util.dll` / `libchaser_util.so`.
 //!
 //! Memory model:
 //!   - All returned pointers are heap-allocated by Rust.
-//!   - The caller MUST free them with the corresponding `scraper_free_*` function.
+//!   - The caller MUST free them with `scraper_free_result()`.
 //!   - Passing NULL for optional filter pointers means "no filter".
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_uint};
 use std::ptr;
+use std::sync::OnceLock;
 
-use crate::chaser::room_list::{
+use crate::room_list::{
     scrape as rs_scrape,
     scrape_with_proxy as rs_scrape_with_proxy,
     RoomFilter, ScrapeOptions, ScrapeResult, UserFilter,
 };
 
 // ----------------------------------------------------------------
+// Global Tokio runtime (reused across all FFI calls)
+// ----------------------------------------------------------------
+
+static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn runtime() -> &'static tokio::runtime::Runtime {
+    RUNTIME.get_or_init(|| {
+        // Runtime::new() only fails on OS-level resource exhaustion, which is unrecoverable.
+        // If it fails here, the process cannot function at all.
+        tokio::runtime::Runtime::new()
+            .unwrap_or_else(|e| panic!("failed to create Tokio runtime: {}", e))
+    })
+}
+
+// ----------------------------------------------------------------
 // C-compatible structs
 // ----------------------------------------------------------------
 
-/// C-compatible room info
 #[repr(C)]
 pub struct CRoomInfo {
     pub room:            c_uint,
     pub max_connections: c_uint,
-    pub map_display:     *mut c_char,  // "可" / "否"
+    pub map_display:     *mut c_char,
     pub public_date:     *mut c_char,
-    pub patrol:          *mut c_char,  // "有" / "×"
+    pub patrol:          *mut c_char,
     pub remarks:         *mut c_char,
 }
 
-/// C-compatible logged-in user
 #[repr(C)]
 pub struct CLoggedInUser {
     pub order:    c_uint,
@@ -42,60 +56,61 @@ pub struct CLoggedInUser {
     pub state:    c_uint,
 }
 
-/// C-compatible scrape result
+/// C-compatible scrape result.
+///
+/// `rooms_cap` / `users_cap` store the actual Vec capacity so that
+/// `scraper_free_result` can reconstruct the Vec correctly.
+/// These fields are internal and must NOT be modified by the caller.
 #[repr(C)]
 pub struct CScrapeResult {
-    // rooms
     pub rooms:       *mut CRoomInfo,
     pub rooms_len:   usize,
-    // logged-in users (NULL + len=0 means "no users")
+    rooms_cap:       usize,          // internal — do not touch from C/C++
     pub users:       *mut CLoggedInUser,
     pub users_len:   usize,
+    users_cap:       usize,          // internal — do not touch from C/C++
     /// 0 = success, non-zero = error (call scraper_last_error() for message)
     pub error_code:  c_uint,
 }
 
-/// C-compatible room filter
 #[repr(C)]
 pub struct CRoomFilter {
-    // 0 = disabled, 1 = enabled
-    pub room_enabled:              c_uint,
-    pub room:                      c_uint,
-    pub room_min_enabled:          c_uint,
-    pub room_min:                  c_uint,
-    pub room_max_enabled:          c_uint,
-    pub room_max:                  c_uint,
-    pub min_max_conn_enabled:      c_uint,
-    pub min_max_conn:              c_uint,
-    pub max_max_conn_enabled:      c_uint,
-    pub max_max_conn:              c_uint,
-    pub map_display:               *const c_char,  // NULL = disabled
-    pub public_date:               *const c_char,
-    pub public_date_contains:      *const c_char,
-    pub patrol:                    *const c_char,
-    pub remarks:                   *const c_char,
-    pub remarks_contains:          *const c_char,
+    pub room_enabled:         c_uint,
+    pub room:                 c_uint,
+    pub room_min_enabled:     c_uint,
+    pub room_min:             c_uint,
+    pub room_max_enabled:     c_uint,
+    pub room_max:             c_uint,
+    pub min_max_conn_enabled: c_uint,
+    pub min_max_conn:         c_uint,
+    pub max_max_conn_enabled: c_uint,
+    pub max_max_conn:         c_uint,
+    pub map_display:          *const c_char,
+    pub public_date:          *const c_char,
+    pub public_date_contains: *const c_char,
+    pub patrol:               *const c_char,
+    pub remarks:              *const c_char,
+    pub remarks_contains:     *const c_char,
 }
 
-/// C-compatible user filter
 #[repr(C)]
 pub struct CUserFilter {
-    pub order_enabled:             c_uint,
-    pub order:                     c_uint,
-    pub order_min_enabled:         c_uint,
-    pub order_min:                 c_uint,
-    pub order_max_enabled:         c_uint,
-    pub order_max:                 c_uint,
-    pub username:                  *const c_char,  // NULL = disabled
-    pub username_contains:         *const c_char,
-    pub room_enabled:              c_uint,
-    pub room:                      c_uint,
-    pub room_min_enabled:          c_uint,
-    pub room_min:                  c_uint,
-    pub room_max_enabled:          c_uint,
-    pub room_max:                  c_uint,
-    pub state_enabled:             c_uint,
-    pub state:                     c_uint,
+    pub order_enabled:         c_uint,
+    pub order:                 c_uint,
+    pub order_min_enabled:     c_uint,
+    pub order_min:             c_uint,
+    pub order_max_enabled:     c_uint,
+    pub order_max:             c_uint,
+    pub username:              *const c_char,
+    pub username_contains:     *const c_char,
+    pub room_enabled:          c_uint,
+    pub room:                  c_uint,
+    pub room_min_enabled:      c_uint,
+    pub room_min:              c_uint,
+    pub room_max_enabled:      c_uint,
+    pub room_max:              c_uint,
+    pub state_enabled:         c_uint,
+    pub state:                 c_uint,
 }
 
 // ----------------------------------------------------------------
@@ -104,7 +119,7 @@ pub struct CUserFilter {
 
 thread_local! {
     static LAST_ERROR: std::cell::RefCell<CString> =
-        std::cell::RefCell::new(CString::new("").unwrap());
+        std::cell::RefCell::new(CString::new("").unwrap_or_default());  // empty string, always valid
 }
 
 fn set_last_error(msg: &str) {
@@ -112,7 +127,7 @@ fn set_last_error(msg: &str) {
     LAST_ERROR.with(|e| *e.borrow_mut() = c);
 }
 
-/// Returns a pointer to the last error message string.
+/// Returns a pointer to the last error message string (UTF-8).
 /// The pointer is valid until the next FFI call on this thread.
 #[no_mangle]
 pub extern "C" fn scraper_last_error() -> *const c_char {
@@ -156,15 +171,15 @@ fn c_room_filter(f: &CRoomFilter) -> RoomFilter {
 
 fn c_user_filter(f: &CUserFilter) -> UserFilter {
     UserFilter {
-        order:             enabled(f.order_enabled,    f.order),
-        order_min:         enabled(f.order_min_enabled,f.order_min),
-        order_max:         enabled(f.order_max_enabled,f.order_max),
+        order:             enabled(f.order_enabled,     f.order),
+        order_min:         enabled(f.order_min_enabled, f.order_min),
+        order_max:         enabled(f.order_max_enabled, f.order_max),
         username:          cstr_opt(f.username),
         username_contains: cstr_opt(f.username_contains),
-        room:              enabled(f.room_enabled,     f.room),
-        room_min:          enabled(f.room_min_enabled, f.room_min),
-        room_max:          enabled(f.room_max_enabled, f.room_max),
-        state:             enabled(f.state_enabled,    f.state),
+        room:              enabled(f.room_enabled,      f.room),
+        room_min:          enabled(f.room_min_enabled,  f.room_min),
+        room_max:          enabled(f.room_max_enabled,  f.room_max),
+        state:             enabled(f.state_enabled,     f.state),
     }
 }
 
@@ -182,19 +197,25 @@ fn build_opts(
     opts
 }
 
-fn result_to_c(res: Result<ScrapeResult, Box<dyn std::error::Error + Send + Sync>>) -> *mut CScrapeResult {
+// ----------------------------------------------------------------
+// Convert ScrapeResult → *mut CScrapeResult
+// (fix: store actual Vec capacity instead of assuming cap == len)
+// ----------------------------------------------------------------
+
+fn result_to_c(
+    res: Result<ScrapeResult, Box<dyn std::error::Error + Send + Sync>>,
+) -> *mut CScrapeResult {
     match res {
         Err(e) => {
             set_last_error(&e.to_string());
-            let r = Box::new(CScrapeResult {
-                rooms: ptr::null_mut(), rooms_len: 0,
-                users: ptr::null_mut(), users_len: 0,
+            Box::into_raw(Box::new(CScrapeResult {
+                rooms: ptr::null_mut(), rooms_len: 0, rooms_cap: 0,
+                users: ptr::null_mut(), users_len: 0, users_cap: 0,
                 error_code: 1,
-            });
-            Box::into_raw(r)
+            }))
         }
         Ok(sr) => {
-            // convert rooms
+            // --- rooms ---
             let mut c_rooms: Vec<CRoomInfo> = sr.rooms.iter().map(|r| CRoomInfo {
                 room:            r.room,
                 max_connections: r.max_connections,
@@ -203,17 +224,19 @@ fn result_to_c(res: Result<ScrapeResult, Box<dyn std::error::Error + Send + Sync
                 patrol:          to_cstring(&r.patrol),
                 remarks:         to_cstring(&r.remarks),
             }).collect();
-            c_rooms.shrink_to_fit();
             let rooms_len = c_rooms.len();
+            let rooms_cap = c_rooms.capacity();
             let rooms_ptr = if rooms_len > 0 {
                 let p = c_rooms.as_mut_ptr();
                 std::mem::forget(c_rooms);
                 p
-            } else { ptr::null_mut() };
+            } else {
+                ptr::null_mut()
+            };
 
-            // convert users
-            let (users_ptr, users_len) = match sr.logged_in_users {
-                None => (ptr::null_mut(), 0),
+            // --- users ---
+            let (users_ptr, users_len, users_cap) = match sr.logged_in_users {
+                None => (ptr::null_mut(), 0, 0),
                 Some(users) => {
                     let mut c_users: Vec<CLoggedInUser> = users.iter().map(|u| CLoggedInUser {
                         order:    u.order,
@@ -221,20 +244,19 @@ fn result_to_c(res: Result<ScrapeResult, Box<dyn std::error::Error + Send + Sync
                         room:     u.room,
                         state:    u.state,
                     }).collect();
-                    c_users.shrink_to_fit();
                     let len = c_users.len();
+                    let cap = c_users.capacity();
                     let p   = c_users.as_mut_ptr();
                     std::mem::forget(c_users);
-                    (p, len)
+                    (p, len, cap)
                 }
             };
 
-            let r = Box::new(CScrapeResult {
-                rooms: rooms_ptr, rooms_len,
-                users: users_ptr, users_len,
+            Box::into_raw(Box::new(CScrapeResult {
+                rooms: rooms_ptr, rooms_len, rooms_cap,
+                users: users_ptr, users_len, users_cap,
                 error_code: 0,
-            });
-            Box::into_raw(r)
+            }))
         }
     }
 }
@@ -249,7 +271,7 @@ fn result_to_c(res: Result<ScrapeResult, Box<dyn std::error::Error + Send + Sync
 /// @param pass         Login password (UTF-8, null-terminated)
 /// @param room_filter  Pointer to CRoomFilter, or NULL for no filter
 /// @param user_filter  Pointer to CUserFilter, or NULL for no filter
-/// @return             Heap-allocated CScrapeResult. Free with scraper_free_result().
+/// @return             Heap-allocated CScrapeResult; free with scraper_free_result().
 #[no_mangle]
 pub extern "C" fn scraper_scrape(
     user:        *const c_char,
@@ -260,9 +282,7 @@ pub extern "C" fn scraper_scrape(
     let user = unsafe { CStr::from_ptr(user) }.to_str().unwrap_or("");
     let pass = unsafe { CStr::from_ptr(pass) }.to_str().unwrap_or("");
     let opts = build_opts(room_filter, user_filter);
-
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let res = rt.block_on(rs_scrape(user, pass, opts));
+    let res = runtime().block_on(rs_scrape(user, pass, opts));
     result_to_c(res)
 }
 
@@ -273,7 +293,7 @@ pub extern "C" fn scraper_scrape(
 /// @param proxy_uri   Proxy URI e.g. "http://192.168.1.1:8080", or "" for direct
 /// @param room_filter Pointer to CRoomFilter, or NULL for no filter
 /// @param user_filter Pointer to CUserFilter, or NULL for no filter
-/// @return            Heap-allocated CScrapeResult. Free with scraper_free_result().
+/// @return            Heap-allocated CScrapeResult; free with scraper_free_result().
 #[no_mangle]
 pub extern "C" fn scraper_scrape_with_proxy(
     user:        *const c_char,
@@ -286,20 +306,19 @@ pub extern "C" fn scraper_scrape_with_proxy(
     let pass      = unsafe { CStr::from_ptr(pass)      }.to_str().unwrap_or("");
     let proxy_uri = unsafe { CStr::from_ptr(proxy_uri) }.to_str().unwrap_or("");
     let opts = build_opts(room_filter, user_filter);
-
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let res = rt.block_on(rs_scrape_with_proxy(user, pass, proxy_uri, opts));
+    let res = runtime().block_on(rs_scrape_with_proxy(user, pass, proxy_uri, opts));
     result_to_c(res)
 }
 
-/// Free a CScrapeResult returned by scraper_scrape* functions.
+/// Free a CScrapeResult returned by scraper_scrape*().
+/// Passing NULL is a no-op.
 #[no_mangle]
 pub extern "C" fn scraper_free_result(result: *mut CScrapeResult) {
     if result.is_null() { return; }
     unsafe {
         let r = Box::from_raw(result);
 
-        // free room strings
+        // Free room strings, then reconstruct Vec with stored capacity
         if !r.rooms.is_null() {
             let rooms = std::slice::from_raw_parts_mut(r.rooms, r.rooms_len);
             for room in rooms.iter() {
@@ -308,16 +327,18 @@ pub extern "C" fn scraper_free_result(result: *mut CScrapeResult) {
                 if !room.patrol.is_null()      { drop(CString::from_raw(room.patrol));      }
                 if !room.remarks.is_null()     { drop(CString::from_raw(room.remarks));     }
             }
-            drop(Vec::from_raw_parts(r.rooms, r.rooms_len, r.rooms_len));
+                // Reconstruct Vec with stored capacity to avoid UB in Vec::from_raw_parts
+            drop(Vec::from_raw_parts(r.rooms, r.rooms_len, r.rooms_cap));
         }
 
-        // free user strings
+        // Free user strings, then reconstruct Vec with the stored capacity
         if !r.users.is_null() {
             let users = std::slice::from_raw_parts_mut(r.users, r.users_len);
             for user in users.iter() {
                 if !user.username.is_null() { drop(CString::from_raw(user.username)); }
             }
-            drop(Vec::from_raw_parts(r.users, r.users_len, r.users_len));
+                // Reconstruct Vec with stored capacity to avoid UB in Vec::from_raw_parts
+            drop(Vec::from_raw_parts(r.users, r.users_len, r.users_cap));
         }
     }
 }
