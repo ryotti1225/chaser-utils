@@ -1,6 +1,6 @@
 [package]
 name = "chaser-util"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "CHaser Online MeetingPlace / game-server scraper with C FFI, proxy support, and real-time map polling"
 license = "MIT"
