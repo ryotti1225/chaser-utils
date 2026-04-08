@@ -1,21 +1,23 @@
-use chaser_util::vs_result::{fetch_vs_result, VsResultQuery};
+use std::time::Duration;
+use chaser_util::poll_realtime_map_view::{poll_map_view, PollOptions};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let query = VsResultQuery::default();
-    match fetch_vs_result("cool33", "cool", query, None).await {
-        Err(e) => println!("fetch failed: {}", e),
-        Ok(battles) => {
-            println!("{} battle(s) found", battles.len());
-            for b in &battles {
-                println!("room={} {} -> {}", b.room, b.start_time, b.end_time);
-                for p in &b.players {
-                    println!("  [{}] {} | get={} rem={} total={} action={:?} item={:?} put={:?} damage={:?}",
-                        p.order, p.username, p.get_turn, p.rem_turn, p.total_point,
-                        p.action_point, p.item_point, p.put_point, p.put_damage);
-                }
-            }
-        }
+async fn main() {
+    let mut rx = poll_map_view(
+        "cool30",
+        "cool",
+        Duration::from_secs(2),
+        PollOptions::default(),
+    );
+
+    while let Some(mv) = rx.recv().await {
+        println!(
+            "turn={:4}  next={:10}  map={}x{}  players={}",
+            mv.turn,
+            mv.next_player,
+            mv.map.len(),
+            mv.map.first().map(|r| r.len()).unwrap_or(0),
+            mv.players.len(),
+        );
     }
-    Ok(())
 }

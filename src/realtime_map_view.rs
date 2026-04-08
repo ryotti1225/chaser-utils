@@ -12,30 +12,23 @@
 //! }
 //! ```
 
-use bytes::Bytes;
+use encoding_rs::SHIFT_JIS;
 use regex::Regex;
 use std::sync::OnceLock;
-use encoding_rs::SHIFT_JIS;
-use http_body_util::{BodyExt, Empty};
-use hyper::Request;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
-use hyper_util::client::proxy::matcher::Matcher;
-use hyper_util::rt::TokioExecutor;
+
+use crate::proxy::{send_follow_redirects, url_encode, BoxError, ProxyMode};
 
 // ----------------------------------------------------------------
 // Public data types
 // ----------------------------------------------------------------
 
 /// One map cell (numeric part of the image filename).
-/// e.g. "012.gif" -> 12, "000.gif" -> 0
+/// e.g. "012.gif" → 12, "000.gif" → 0
 pub type TileId = u32;
 
-/// Server base URL used to build tile image URLs.
 const SERVER_IMAGE_BASE: &str = "http://www7019ug.sakura.ne.jp/CHaserOnline003/img/";
 
 /// Returns the full image URL for a given TileId.
-/// e.g. 12 -> "http://www7019ug.sakura.ne.jp/CHaserOnline003/img/012.gif"
 pub fn tile_image_url(tile: TileId) -> String {
     format!("{}{:03}.gif", SERVER_IMAGE_BASE, tile)
 }
@@ -44,11 +37,11 @@ pub fn tile_image_url(tile: TileId) -> String {
 #[derive(Debug, Clone)]
 pub struct PlayerInfo {
     pub username: String,
-    pub attr_a:   i32,   // A: attack
-    pub attr_i:   i32,   // I: intelligence
-    pub attr_p:   i32,   // P: power
-    pub attr_pd:  i32,   // PD: power defense
-    pub attr_t:   i32,   // T: total
+    pub attr_a:   i32,
+    pub attr_i:   i32,
+    pub attr_p:   i32,
+    pub attr_pd:  i32,
+    pub attr_t:   i32,
     /// Command list (one entry per command line, e.g. "gr 12,0,12").
     pub commands: Vec<String>,
 }
@@ -56,173 +49,42 @@ pub struct PlayerInfo {
 /// Full result of a map view fetch.
 #[derive(Debug, Clone)]
 pub struct MapViewResult {
-    /// Room name extracted from the H1 tag "[...]", e.g. "Renshuu_x5".
     pub room_name:   String,
-    /// Current turn number.
     pub turn:        u32,
-    /// Username of the player who acts next.
     pub next_player: String,
-    /// Map cells as a 2D array [row][col].
+    /// Map cells as a 2D array \[row\]\[col\].
     pub map:         Vec<Vec<TileId>>,
-    /// List of player information.
     pub players:     Vec<PlayerInfo>,
 }
 
 /// Fetch options.
 #[derive(Debug, Clone, Default)]
 pub struct MapViewOptions {
-    /// Optional proxy URI. None = auto-detect, Some("") = direct connection.
+    /// Optional proxy URI.  `None` = auto-detect, `Some("")` = direct connection.
     pub proxy_uri: Option<String>,
 }
 
 // ----------------------------------------------------------------
-// Proxy mode (internal)
+// Lazy-compiled regexes
 // ----------------------------------------------------------------
 
-enum ProxyMode {
-    Auto,
-    Direct,
-    Manual(String),
+fn re_img_src() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"/img/(\d{1,3})\.gif").expect("re_img_src"))
 }
 
-#[derive(Clone)]
-struct ProxyConnector {
-    inner:      HttpConnector,
-    proxy_host: String,
-    proxy_port: u16,
+fn re_turn() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"turn=(\d+)\s+Next=([^<\s]+)").expect("re_turn"))
 }
 
-impl tower_service::Service<http::Uri> for ProxyConnector {
-    type Response = <HttpConnector as tower_service::Service<http::Uri>>::Response;
-    type Error    = <HttpConnector as tower_service::Service<http::Uri>>::Error;
-    type Future   = <HttpConnector as tower_service::Service<http::Uri>>::Future;
-
-    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>)
-        -> std::task::Poll<Result<(), Self::Error>>
-    {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, _uri: http::Uri) -> Self::Future {
-        let proxy_uri: http::Uri =
-            format!("http://{}:{}", self.proxy_host, self.proxy_port)
-            .parse()
-            .unwrap_or_else(|_| http::Uri::from_static("http://127.0.0.1:8080"));
-        self.inner.call(proxy_uri)
-    }
+fn re_room_name() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)<h1[^>]*>[^\[]*\[([^\]]+)\]").expect("re_room_name"))
 }
 
 // ----------------------------------------------------------------
-// HTTP helpers (internal)
-// ----------------------------------------------------------------
-
-async fn send_once(
-    url:        &str,
-    extra:      &[(&'static str, String)],
-    proxy_mode: &ProxyMode,
-) -> Result<(u16, hyper::HeaderMap, Bytes), Box<dyn std::error::Error + Send + Sync>> {
-    let target_uri: http::Uri = url.parse()?;
-
-    macro_rules! build_req {
-        ($b:expr) => {{
-            let mut b = $b;
-            for (k, v) in extra { b = b.header(*k, v.as_str()); }
-            b.body(Empty::<Bytes>::new())?
-        }};
-    }
-
-    let resp = match proxy_mode {
-        ProxyMode::Auto => {
-            let matcher = Matcher::from_system();
-            if let Some(intercept) = matcher.intercept(&target_uri) {
-                let ph = intercept.uri().host().unwrap_or("127.0.0.1").to_string();
-                let pp = intercept.uri().port_u16().unwrap_or(8080);
-                let mut conn = HttpConnector::new();
-                conn.enforce_http(false);
-                let client = Client::builder(TokioExecutor::new())
-                    .build::<_, Empty<Bytes>>(ProxyConnector {
-                        inner: conn, proxy_host: ph, proxy_port: pp,
-                    });
-                let mut b = Request::builder().method("GET").uri(url)
-                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
-                if let Some(auth) = intercept.basic_auth() {
-                    b = b.header("Proxy-Authorization", auth);
-                }
-                client.request(build_req!(b)).await?
-            } else {
-                let mut conn = HttpConnector::new();
-                conn.enforce_http(false);
-                let client = Client::builder(TokioExecutor::new())
-                    .build::<_, Empty<Bytes>>(conn);
-                let b = Request::builder().method("GET").uri(url)
-                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
-                client.request(build_req!(b)).await?
-            }
-        }
-        ProxyMode::Direct => {
-            let mut conn = HttpConnector::new();
-            conn.enforce_http(false);
-            let client = Client::builder(TokioExecutor::new())
-                .build::<_, Empty<Bytes>>(conn);
-            let b = Request::builder().method("GET").uri(url)
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
-            client.request(build_req!(b)).await?
-        }
-        ProxyMode::Manual(proxy_uri_str) => {
-            let proxy_uri: http::Uri = proxy_uri_str.parse()?;
-            let ph = proxy_uri.host().unwrap_or("127.0.0.1").to_string();
-            let pp = proxy_uri.port_u16().unwrap_or(8080);
-            let mut conn = HttpConnector::new();
-            conn.enforce_http(false);
-            let client = Client::builder(TokioExecutor::new())
-                .build::<_, Empty<Bytes>>(ProxyConnector {
-                    inner: conn, proxy_host: ph, proxy_port: pp,
-                });
-            let b = Request::builder().method("GET").uri(url)
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
-            client.request(build_req!(b)).await?
-        }
-    };
-
-    let status  = resp.status().as_u16();
-    let headers = resp.headers().clone();
-    let body    = resp.into_body().collect().await?.to_bytes();
-    Ok((status, headers, body))
-}
-
-async fn send_follow_redirects(
-    start_url:  &str,
-    extra:      &[(&'static str, String)],
-    proxy_mode: &ProxyMode,
-) -> Result<(Bytes, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
-    let mut url      = start_url.to_string();
-    let mut jsession = None::<String>;
-
-    for _ in 0..10 {
-        let (status, headers, body) = send_once(&url, extra, proxy_mode).await?;
-
-        for val in headers.get_all("set-cookie").iter() {
-            for part in val.to_str().unwrap_or("").split(';') {
-                if let Some(id) = part.trim().strip_prefix("JSESSIONID=") {
-                    jsession = Some(id.to_string());
-                }
-            }
-        }
-
-        if (300..400).contains(&status) {
-            if let Some(loc) = headers.get("location") {
-                url = loc.to_str()?.to_string();
-                continue;
-            }
-        }
-
-        return Ok((body, jsession));
-    }
-    Err("too many redirects".into())
-}
-
-// ----------------------------------------------------------------
-// HTML parsing
+// HTML parsing helpers
 // ----------------------------------------------------------------
 
 fn inner_text<'a>(node: &tl::Node<'a>, parser: &'a tl::Parser<'a>) -> String {
@@ -237,9 +99,7 @@ fn inner_text<'a>(node: &tl::Node<'a>, parser: &'a tl::Parser<'a>) -> String {
     }
 }
 
-/// Extracts "[RoomName]" from the H1 element using a lazy regex.
-/// e.g. "[map view title] [Renshuu_x3]" -> "Renshuu_x3"
-fn parse_room_name(html: &str) -> String {
+pub(crate) fn parse_room_name(html: &str) -> String {
     re_room_name()
         .captures(html)
         .and_then(|c| c.get(1))
@@ -247,49 +107,7 @@ fn parse_room_name(html: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Parses "turn=N Next=PlayerName" text into (turn, next_player).
-fn parse_turn_info(text: &str) -> (u32, String) {
-    let mut turn        = 0u32;
-    let mut next_player = String::new();
-
-    for token in text.split_whitespace() {
-        if let Some(v) = token.strip_prefix("turn=") {
-            turn = v.parse().unwrap_or(0);
-        } else if let Some(v) = token.strip_prefix("Next=") {
-            next_player = v.to_string();
-        }
-    }
-    (turn, next_player)
-}
-
-// ----------------------------------------------------------------
-// Lazy-compiled regexes (compiled once at first use via OnceLock)
-// ----------------------------------------------------------------
-
-/// Matches /img/NNN.gif (1-3 digit tile IDs only) directly in a tr slice.
-fn re_img_src() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"/img/(\d{1,3})\.gif").unwrap())
-}
-
-/// Matches "turn=N Next=PlayerName".
-fn re_turn() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"turn=(\d+)\s+Next=([^<\s]+)").unwrap())
-}
-
-/// Matches "[RoomName]" inside an H1 element.
-fn re_room_name() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)<h1[^>]*>[^\[]*\[([^\]]+)\]").unwrap())
-}
-
-/// Parses the map table into a 2D TileId array.
-/// - turn/next extracted via re_turn()
-/// - Table located by string search; rows split by <tr position
-/// - Tile IDs extracted per row via re_img_src() (no dot-all regex, fast)
-fn parse_map(html: &str) -> (Vec<Vec<TileId>>, u32, String) {
-    // Extract turn number and next player
+pub(crate) fn parse_map(html: &str) -> (Vec<Vec<TileId>>, u32, String) {
     let (turn, next_player) = re_turn()
         .captures(html)
         .map(|c| (
@@ -298,7 +116,6 @@ fn parse_map(html: &str) -> (Vec<Vec<TileId>>, u32, String) {
         ))
         .unwrap_or((0, String::new()));
 
-    // Locate the map table by attribute; lowercase conversion done only once
     let lower = html.to_ascii_lowercase();
     let table_start = match lower.find(r#"cellpadding="0""#)
         .and_then(|i| html[..i].rfind('<'))
@@ -313,7 +130,6 @@ fn parse_map(html: &str) -> (Vec<Vec<TileId>>, u32, String) {
     let table_html  = &html[table_start..table_end];
     let table_lower = &lower[table_start..table_end];
 
-    // Collect <tr positions to delimit row ranges
     let tr_positions: Vec<usize> = table_lower
         .match_indices("<tr")
         .map(|(i, _)| i)
@@ -321,14 +137,13 @@ fn parse_map(html: &str) -> (Vec<Vec<TileId>>, u32, String) {
 
     let mut map: Vec<Vec<TileId>> = Vec::new();
     for (idx, &tr_start) in tr_positions.iter().enumerate() {
-        let tr_end = tr_positions.get(idx + 1).copied().unwrap_or(table_html.len());
+        let tr_end   = tr_positions.get(idx + 1).copied().unwrap_or(table_html.len());
         let tr_slice = &table_html[tr_start..tr_end];
 
         let row: Vec<TileId> = re_img_src()
             .captures_iter(tr_slice)
             .filter_map(|c| c.get(1).and_then(|m| {
                 let id: u32 = m.as_str().parse().ok()?;
-                // Exclude player tile IDs (1000-9000 range)
                 if id >= 1000 { return None; }
                 Some(id)
             }))
@@ -342,12 +157,9 @@ fn parse_map(html: &str) -> (Vec<Vec<TileId>>, u32, String) {
     (map, turn, next_player)
 }
 
-/// Parses the player information table.
-/// Format: "[img] username A:N I:N P:N PD:N T:N"
-fn parse_players(dom: &tl::VDom) -> Vec<PlayerInfo> {
+pub(crate) fn parse_players(dom: &tl::VDom) -> Vec<PlayerInfo> {
     let parser = dom.parser();
 
-    // The border=1 table contains player information
     let player_table = match dom
         .query_selector(r#"table[border="1"]"#)
         .and_then(|mut q| q.next())
@@ -368,14 +180,6 @@ fn parse_players(dom: &tl::VDom) -> Vec<PlayerInfo> {
     };
     let p2 = dom2.parser();
 
-    let mut players = Vec::new();
-
-    // Table structure:
-    //   tr[0]: each td[valign="top"] holds one player's info
-    //   tr[1]: each td[valign="top"] holds one player's command list (<font size="2">)
-    // Match by index.
-
-    // Collect tr HTML strings
     let tr_htmls: Vec<String> = dom2
         .query_selector("tr").into_iter().flatten()
         .filter_map(|h| h.get(p2))
@@ -390,12 +194,10 @@ fn parse_players(dom: &tl::VDom) -> Vec<PlayerInfo> {
         })
         .collect();
 
-    // tr[0]: parse player info from each td
     let mut player_data: Vec<(String, i32, i32, i32, i32, i32)> = Vec::new();
     if let Some(tr0) = tr_htmls.first() {
         if let Ok(d) = tl::parse(tr0, tl::ParserOptions::default()) {
             let p = d.parser();
-            // Collect td HTML strings first to avoid lifetime issues
             let td_htmls: Vec<String> = d.query_selector(r#"td[valign="top"]"#)
                 .into_iter().flatten()
                 .filter_map(|h| h.get(p))
@@ -413,7 +215,6 @@ fn parse_players(dom: &tl::VDom) -> Vec<PlayerInfo> {
             for td_html in &td_htmls {
                 if let Ok(td_dom) = tl::parse(td_html, tl::ParserOptions::default()) {
                     let tp = td_dom.parser();
-                    // Collect text from all nodes
                     let text: String = td_dom.nodes().iter()
                         .map(|n| inner_text(n, tp))
                         .collect::<Vec<_>>()
@@ -450,7 +251,6 @@ fn parse_players(dom: &tl::VDom) -> Vec<PlayerInfo> {
         }
     }
 
-    // tr[1]: parse command list from each font element
     let mut all_commands: Vec<Vec<String>> = Vec::new();
     if let Some(tr1) = tr_htmls.get(1) {
         if let Ok(d) = tl::parse(tr1, tl::ParserOptions::default()) {
@@ -485,25 +285,22 @@ fn parse_players(dom: &tl::VDom) -> Vec<PlayerInfo> {
         }
     }
 
-    // Pair player_data with all_commands by index to build PlayerInfo entries
+    let mut players = Vec::new();
     for (i, (username, attr_a, attr_i, attr_p, attr_pd, attr_t)) in player_data.into_iter().enumerate() {
         let commands = all_commands.get(i).cloned().unwrap_or_default();
         players.push(PlayerInfo { username, attr_a, attr_i, attr_p, attr_pd, attr_t, commands });
     }
-
     players
 }
 
 // ----------------------------------------------------------------
-// URLs (Server path is separate from MeetingPlace)
+// URLs
 // ----------------------------------------------------------------
 
-/// Base URL for obtaining a JSESSIONID (Server side).
-const SERVER_BASE_URL: &str = "http://www7019ug.sakura.ne.jp/CHaserOnline003/Server/";
-/// Authentication endpoint.
-const SERVER_CHECK_URL: &str = "http://www7019ug.sakura.ne.jp/CHaserOnline003/Server/UserCheck";
-/// Map view page.
-const MAP_VIEW_URL: &str = "http://www7019ug.sakura.ne.jp/CHaserOnline003/Server/MapView.jsp";
+const SERVER_CHECK_URL: &str =
+    "http://www7019ug.sakura.ne.jp/CHaserOnline003/Server/UserCheck";
+const MAP_VIEW_URL: &str =
+    "http://www7019ug.sakura.ne.jp/CHaserOnline003/Server/MapView.jsp";
 
 // ----------------------------------------------------------------
 // Core logic
@@ -513,27 +310,26 @@ async fn fetch_inner(
     user:       &str,
     pass:       &str,
     proxy_mode: ProxyMode,
-) -> Result<MapViewResult, Box<dyn std::error::Error + Send + Sync>> {
-    // Step 1+2 combined: fetch JSESSIONID and authenticate in a single request
-    let check_url = format!("{}?user={}&pass={}&select=mapview", SERVER_CHECK_URL, user, pass);
-    let (_, jsession) = send_follow_redirects(
-        &check_url,
-        &[],
-        &proxy_mode,
-    ).await?;
+) -> Result<MapViewResult, BoxError> {
+    // FIX: user and pass are percent-encoded to prevent query parameter injection.
+    let check_url = format!(
+        "{}?user={}&pass={}&select=mapview",
+        SERVER_CHECK_URL,
+        url_encode(user),
+        url_encode(pass),
+    );
+    let (_, jsession) = send_follow_redirects(&check_url, &[], &proxy_mode).await?;
     let jsessionid = jsession.ok_or("Server JSESSIONID not found")?;
     let cookie = format!("JSESSIONID={}", jsessionid);
 
-    let (body, _) = send_follow_redirects(
-        MAP_VIEW_URL, &[("Cookie", cookie)], &proxy_mode,
-    ).await?;
+    let (body, _) =
+        send_follow_redirects(MAP_VIEW_URL, &[("Cookie", cookie)], &proxy_mode).await?;
     let (html, _, _) = SHIFT_JIS.decode(&body);
 
     let room_name                = parse_room_name(&html);
     let (map, turn, next_player) = parse_map(&html);
-
-    let dom     = tl::parse(&html, tl::ParserOptions::default())?;
-    let players = parse_players(&dom);
+    let dom                      = tl::parse(&html, tl::ParserOptions::default())?;
+    let players                  = parse_players(&dom);
 
     Ok(MapViewResult { room_name, turn, next_player, map, players })
 }
@@ -543,20 +339,11 @@ async fn fetch_inner(
 // ----------------------------------------------------------------
 
 /// Fetches the real-time game map view.
-///
-/// # Arguments
-/// * `user` - Login username (managed by caller; changes per game)
-/// * `pass` - Login password (managed by caller; changes per game)
-/// * `opts` - Fetch options
 pub async fn fetch_map_view(
     user: &str,
     pass: &str,
     opts: MapViewOptions,
-) -> Result<MapViewResult, Box<dyn std::error::Error + Send + Sync>> {
-    let proxy_mode = match opts.proxy_uri {
-        None                        => ProxyMode::Auto,
-        Some(ref s) if s.is_empty() => ProxyMode::Direct,
-        Some(s)                     => ProxyMode::Manual(s),
-    };
+) -> Result<MapViewResult, BoxError> {
+    let proxy_mode = ProxyMode::from_option(opts.proxy_uri.as_deref());
     fetch_inner(user, pass, proxy_mode).await
 }

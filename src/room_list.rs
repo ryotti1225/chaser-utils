@@ -3,7 +3,7 @@
 //! # Quick start
 //!
 //! ```no_run
-//! use chaser_util::room_list::{scrape, scrape_with_proxy, ScrapeOptions, RoomFilter, UserFilter};
+//! use chaser_util::room_list::{scrape, scrape_with_proxy, ScrapeOptions};
 //!
 //! #[tokio::main]
 //! async fn main() {
@@ -18,31 +18,27 @@
 //!     ).await.unwrap();
 //! }
 //! ```
-use bytes::Bytes;
+
 use encoding_rs::SHIFT_JIS;
-use http_body_util::{BodyExt, Empty};
-use hyper::Request;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
-use hyper_util::client::proxy::matcher::Matcher;
-use hyper_util::rt::TokioExecutor;
+
+use crate::proxy::{send_follow_redirects, url_encode, BoxError, ProxyMode};
 
 // ----------------------------------------------------------------
 // Public data types
 // ----------------------------------------------------------------
 
-/// One room entry from the public room table
+/// One room entry from the public room table.
 #[derive(Debug, Clone)]
 pub struct RoomInfo {
     pub room:            u32,
     pub max_connections: u32,
-    pub map_display:     String,  // "可" / "否"
+    pub map_display:     String,
     pub public_date:     String,
-    pub patrol:          String,  // "有" / "×"
+    pub patrol:          String,
     pub remarks:         String,
 }
 
-/// One logged-in user row
+/// One logged-in user row.
 #[derive(Debug, Clone)]
 pub struct LoggedInUser {
     pub order:    u32,
@@ -51,31 +47,31 @@ pub struct LoggedInUser {
     pub state:    u32,
 }
 
-/// Full scrape result
+/// Full scrape result.
 #[derive(Debug, Clone)]
 pub struct ScrapeResult {
-    /// None means no users are currently logged in
+    /// `None` means no users are currently logged in.
     pub logged_in_users: Option<Vec<LoggedInUser>>,
     pub rooms:           Vec<RoomInfo>,
 }
 
 // ----------------------------------------------------------------
-// Constants  (fix: was fn returning String; changed to &str constants)
+// Constants
 // ----------------------------------------------------------------
 
-/// Map display filter values
+#[allow(non_snake_case)]
 pub mod MapDisplay {
     pub const ENABLED:  &str = "\u{53ef}";  // 可
     pub const DISABLED: &str = "\u{5426}";  // 否
 }
 
-/// Patrol filter values
+#[allow(non_snake_case)]
 pub mod Patrol {
     pub const YES: &str = "\u{6709}";  // 有
     pub const NO:  &str = "\u{00d7}";  // ×
 }
 
-/// Remarks filter values
+#[allow(non_snake_case)]
 pub mod Remarks {
     pub const RA:  &str = "\u{30e9}";  // ラ
     pub const SAI: &str = "\u{57fc}";  // 埼
@@ -86,7 +82,7 @@ pub mod Remarks {
 // Filter types
 // ----------------------------------------------------------------
 
-/// Filter for room list. All fields are `None` by default (= no filter).
+/// Filter for room list.  All fields default to `None` (= no filter).
 #[derive(Debug, Clone, Default)]
 pub struct RoomFilter {
     pub room:                 Option<u32>,
@@ -104,22 +100,22 @@ pub struct RoomFilter {
 
 impl RoomFilter {
     pub fn matches(&self, r: &RoomInfo) -> bool {
-        if let Some(n)     = self.room                   { if r.room != n                             { return false; } }
-        if let Some(n)     = self.room_min               { if r.room < n                              { return false; } }
-        if let Some(n)     = self.room_max               { if r.room > n                              { return false; } }
-        if let Some(n)     = self.min_max_conn           { if r.max_connections < n                   { return false; } }
-        if let Some(n)     = self.max_max_conn           { if r.max_connections > n                   { return false; } }
-        if let Some(ref s) = self.map_display            { if r.map_display != *s                     { return false; } }
-        if let Some(ref s) = self.public_date            { if r.public_date != *s                     { return false; } }
-        if let Some(ref s) = self.public_date_contains   { if !r.public_date.contains(s.as_str())    { return false; } }
-        if let Some(ref s) = self.patrol                 { if r.patrol != *s                          { return false; } }
-        if let Some(ref s) = self.remarks                { if r.remarks != *s                         { return false; } }
-        if let Some(ref s) = self.remarks_contains       { if !r.remarks.contains(s.as_str())        { return false; } }
+        if let Some(n)     = self.room                 { if r.room != n                          { return false; } }
+        if let Some(n)     = self.room_min             { if r.room < n                           { return false; } }
+        if let Some(n)     = self.room_max             { if r.room > n                           { return false; } }
+        if let Some(n)     = self.min_max_conn         { if r.max_connections < n                { return false; } }
+        if let Some(n)     = self.max_max_conn         { if r.max_connections > n                { return false; } }
+        if let Some(ref s) = self.map_display          { if r.map_display != *s                  { return false; } }
+        if let Some(ref s) = self.public_date          { if r.public_date != *s                  { return false; } }
+        if let Some(ref s) = self.public_date_contains { if !r.public_date.contains(s.as_str()) { return false; } }
+        if let Some(ref s) = self.patrol               { if r.patrol != *s                       { return false; } }
+        if let Some(ref s) = self.remarks              { if r.remarks != *s                      { return false; } }
+        if let Some(ref s) = self.remarks_contains     { if !r.remarks.contains(s.as_str())     { return false; } }
         true
     }
 }
 
-/// Filter for logged-in user list. All fields are `None` by default (= no filter).
+/// Filter for logged-in user list.  All fields default to `None` (= no filter).
 #[derive(Debug, Clone, Default)]
 pub struct UserFilter {
     pub order:             Option<u32>,
@@ -135,20 +131,20 @@ pub struct UserFilter {
 
 impl UserFilter {
     pub fn matches(&self, u: &LoggedInUser) -> bool {
-        if let Some(n)     = self.order              { if u.order != n                             { return false; } }
-        if let Some(n)     = self.order_min          { if u.order < n                              { return false; } }
-        if let Some(n)     = self.order_max          { if u.order > n                              { return false; } }
-        if let Some(ref s) = self.username           { if u.username != *s                        { return false; } }
-        if let Some(ref s) = self.username_contains  { if !u.username.contains(s.as_str())       { return false; } }
-        if let Some(n)     = self.room               { if u.room != n                             { return false; } }
-        if let Some(n)     = self.room_min           { if u.room < n                              { return false; } }
-        if let Some(n)     = self.room_max           { if u.room > n                              { return false; } }
-        if let Some(n)     = self.state              { if u.state != n                            { return false; } }
+        if let Some(n)     = self.order             { if u.order != n                           { return false; } }
+        if let Some(n)     = self.order_min         { if u.order < n                            { return false; } }
+        if let Some(n)     = self.order_max         { if u.order > n                            { return false; } }
+        if let Some(ref s) = self.username          { if u.username != *s                      { return false; } }
+        if let Some(ref s) = self.username_contains { if !u.username.contains(s.as_str())     { return false; } }
+        if let Some(n)     = self.room              { if u.room != n                            { return false; } }
+        if let Some(n)     = self.room_min          { if u.room < n                             { return false; } }
+        if let Some(n)     = self.room_max          { if u.room > n                             { return false; } }
+        if let Some(n)     = self.state             { if u.state != n                           { return false; } }
         true
     }
 }
 
-/// Scraping options: filters applied after fetching
+/// Scraping options: filters applied after fetching.
 #[derive(Debug, Clone, Default)]
 pub struct ScrapeOptions {
     pub room_filter: Option<RoomFilter>,
@@ -164,158 +160,6 @@ impl ScrapeOptions {
         self.user_filter = Some(f);
         self
     }
-}
-
-// ----------------------------------------------------------------
-// Proxy mode (internal)
-// ----------------------------------------------------------------
-
-enum ProxyMode {
-    Auto,
-    Direct,
-    Manual(String),
-}
-
-// ----------------------------------------------------------------
-// ProxyConnector
-// ----------------------------------------------------------------
-
-#[derive(Clone)]
-struct ProxyConnector {
-    inner:      HttpConnector,
-    proxy_host: String,
-    proxy_port: u16,
-}
-
-impl tower_service::Service<http::Uri> for ProxyConnector {
-    type Response = <HttpConnector as tower_service::Service<http::Uri>>::Response;
-    type Error    = <HttpConnector as tower_service::Service<http::Uri>>::Error;
-    type Future   = <HttpConnector as tower_service::Service<http::Uri>>::Future;
-
-    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>)
-        -> std::task::Poll<Result<(), Self::Error>>
-    {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, _uri: http::Uri) -> Self::Future {
-        let proxy_uri: http::Uri =
-            format!("http://{}:{}", self.proxy_host, self.proxy_port)
-            .parse()
-            .unwrap_or_else(|_| http::Uri::from_static("http://127.0.0.1:8080"));
-        self.inner.call(proxy_uri)
-    }
-}
-
-// ----------------------------------------------------------------
-// HTTP layer
-// ----------------------------------------------------------------
-
-async fn send_once(
-    url:        &str,
-    extra:      &[(&'static str, String)],
-    proxy_mode: &ProxyMode,
-) -> Result<(u16, hyper::HeaderMap, Bytes), Box<dyn std::error::Error + Send + Sync>> {
-    let target_uri: http::Uri = url.parse()?;
-
-    macro_rules! build_req {
-        ($b:expr) => {{
-            let mut b = $b;
-            for (k, v) in extra { b = b.header(*k, v.as_str()); }
-            b.body(Empty::<Bytes>::new())?
-        }};
-    }
-
-    let resp = match proxy_mode {
-        ProxyMode::Auto => {
-            let matcher = Matcher::from_system();
-            if let Some(intercept) = matcher.intercept(&target_uri) {
-                let ph = intercept.uri().host().unwrap_or("127.0.0.1").to_string();
-                let pp = intercept.uri().port_u16().unwrap_or(8080);
-                let mut conn = HttpConnector::new();
-                conn.enforce_http(false);
-                let client = Client::builder(TokioExecutor::new())
-                    .build::<_, Empty<Bytes>>(ProxyConnector {
-                        inner: conn, proxy_host: ph, proxy_port: pp,
-                    });
-                let mut b = Request::builder().method("GET").uri(url)
-                    .header("User-Agent", "Mozilla/5.0 (compatible; RustScraper/1.0)");
-                if let Some(auth) = intercept.basic_auth() {
-                    b = b.header("Proxy-Authorization", auth);
-                }
-                client.request(build_req!(b)).await?
-            } else {
-                let mut conn = HttpConnector::new();
-                conn.enforce_http(false);
-                let client = Client::builder(TokioExecutor::new())
-                    .build::<_, Empty<Bytes>>(conn);
-                let b = Request::builder().method("GET").uri(url)
-                    .header("User-Agent", "Mozilla/5.0 (compatible; RustScraper/1.0)");
-                client.request(build_req!(b)).await?
-            }
-        }
-
-        ProxyMode::Direct => {
-            let mut conn = HttpConnector::new();
-            conn.enforce_http(false);
-            let client = Client::builder(TokioExecutor::new())
-                .build::<_, Empty<Bytes>>(conn);
-            let b = Request::builder().method("GET").uri(url)
-                .header("User-Agent", "Mozilla/5.0 (compatible; RustScraper/1.0)");
-            client.request(build_req!(b)).await?
-        }
-
-        ProxyMode::Manual(proxy_uri_str) => {
-            let proxy_uri: http::Uri = proxy_uri_str.parse()?;
-            let ph = proxy_uri.host().unwrap_or("127.0.0.1").to_string();
-            let pp = proxy_uri.port_u16().unwrap_or(8080);
-            let mut conn = HttpConnector::new();
-            conn.enforce_http(false);
-            let client = Client::builder(TokioExecutor::new())
-                .build::<_, Empty<Bytes>>(ProxyConnector {
-                    inner: conn, proxy_host: ph, proxy_port: pp,
-                });
-            let b = Request::builder().method("GET").uri(url)
-                .header("User-Agent", "Mozilla/5.0 (compatible; RustScraper/1.0)");
-            client.request(build_req!(b)).await?
-        }
-    };
-
-    let status  = resp.status().as_u16();
-    let headers = resp.headers().clone();
-    let body    = resp.into_body().collect().await?.to_bytes();
-    Ok((status, headers, body))
-}
-
-async fn send_follow_redirects(
-    start_url:  &str,
-    extra:      &[(&'static str, String)],
-    proxy_mode: &ProxyMode,
-) -> Result<(Bytes, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
-    let mut url      = start_url.to_string();
-    let mut jsession = None::<String>;
-
-    for _ in 0..10 {
-        let (status, headers, body) = send_once(&url, extra, proxy_mode).await?;
-
-        for val in headers.get_all("set-cookie").iter() {
-            for part in val.to_str().unwrap_or("").split(';') {
-                if let Some(id) = part.trim().strip_prefix("JSESSIONID=") {
-                    jsession = Some(id.to_string());
-                }
-            }
-        }
-
-        if (300..400).contains(&status) {
-            if let Some(loc) = headers.get("location") {
-                url = loc.to_str()?.to_string();
-                continue;
-            }
-        }
-
-        return Ok((body, jsession));
-    }
-    Err("too many redirects".into())
 }
 
 // ----------------------------------------------------------------
@@ -352,10 +196,13 @@ fn trim_full(s: String) -> String {
 
 fn parse_tr_cells(tr_html: &str) -> Vec<String> {
     let dom = match tl::parse(tr_html, tl::ParserOptions::default()) {
-        Ok(d) => d, Err(_) => return vec![],
+        Ok(d) => d,
+        Err(_) => return vec![],
     };
     let p = dom.parser();
-    dom.query_selector("td").into_iter().flatten()
+    dom.query_selector("td")
+        .into_iter()
+        .flatten()
         .filter_map(|h| h.get(p))
         .map(|n| inner_text(n, p).trim().to_string())
         .collect()
@@ -369,19 +216,23 @@ fn parse_logged_in_users_html(dom: &tl::VDom) -> Option<Vec<LoggedInUser>> {
     let parser = dom.parser();
     let node   = dom
         .query_selector(r#"td[valign="top"]"#)?
-        .next()?.get(parser)?;
+        .next()?
+        .get(parser)?;
 
     let td_html = match node {
         tl::Node::Tag(tag) => children_html(tag, parser),
         _ => return None,
     };
 
+    // "ログイン中のユーザーはいません"
     const NO_USERS: &str =
         "\u{30ed}\u{30b0}\u{30a4}\u{30f3}\u{4e2d}\u{306e}\
          \u{30e6}\u{30fc}\u{30b6}\u{30fc}\u{306f}\
          \u{3044}\u{307e}\u{305b}\u{3093}";
 
-    if td_html.contains(NO_USERS) { return None; }
+    if td_html.contains(NO_USERS) {
+        return None;
+    }
 
     let dom2 = tl::parse(&td_html, tl::ParserOptions::default()).ok()?;
     let p2   = dom2.parser();
@@ -395,11 +246,22 @@ fn parse_logged_in_users_html(dom: &tl::VDom) -> Option<Vec<LoggedInUser>> {
             _ => continue,
         };
         let cells = parse_tr_cells(&tr_html);
-        if cells.len() < 4 { continue; }
-        if is_header { is_header = false; continue; }
+        if cells.len() < 4 {
+            continue;
+        }
+        if is_header {
+            is_header = false;
+            continue;
+        }
 
-        let order = match cells[0].parse::<u32>() { Ok(n) => n, Err(_) => continue };
-        let room  = match cells[2].parse::<u32>() { Ok(n) => n, Err(_) => continue };
+        let order = match cells[0].parse::<u32>() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let room  = match cells[2].parse::<u32>() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
         let state = cells[3].parse::<u32>().unwrap_or(0);
 
         users.push(LoggedInUser { order, username: cells[1].clone(), room, state });
@@ -421,7 +283,8 @@ fn parse_rooms_html(dom: &tl::VDom) -> Vec<RoomInfo> {
     };
 
     let dom2 = match tl::parse(&center_html, tl::ParserOptions::default()) {
-        Ok(d) => d, Err(_) => return vec![],
+        Ok(d)  => d,
+        Err(_) => return vec![],
     };
     let p2 = dom2.parser();
 
@@ -434,10 +297,18 @@ fn parse_rooms_html(dom: &tl::VDom) -> Vec<RoomInfo> {
             _ => continue,
         };
         let cells = parse_tr_cells(&tr_html);
-        if cells.len() < 6 { continue; }
-        if is_header { is_header = false; continue; }
+        if cells.len() < 6 {
+            continue;
+        }
+        if is_header {
+            is_header = false;
+            continue;
+        }
 
-        let room     = match cells[0].parse::<u32>() { Ok(n) => n, Err(_) => continue };
+        let room = match cells[0].parse::<u32>() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
         let max_conn = cells[1].parse::<u32>().unwrap_or(0);
 
         rooms.push(RoomInfo {
@@ -453,25 +324,39 @@ fn parse_rooms_html(dom: &tl::VDom) -> Vec<RoomInfo> {
 }
 
 // ----------------------------------------------------------------
-// Core scrape logic (shared)
+// URLs
 // ----------------------------------------------------------------
 
 const BASE_URL:  &str = "http://www7019ug.sakura.ne.jp/CHaserOnline003/MeetingPlace";
 const CHECK_URL: &str = "http://www7019ug.sakura.ne.jp/CHaserOnline003/MeetingPlace/UserCheck";
+
+// ----------------------------------------------------------------
+// Core scrape logic
+// ----------------------------------------------------------------
 
 async fn scrape_inner(
     user:       &str,
     pass:       &str,
     opts:       ScrapeOptions,
     proxy_mode: ProxyMode,
-) -> Result<ScrapeResult, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ScrapeResult, BoxError> {
+    // Step 1: Fetch the top page to obtain JSESSIONID
     let (_, jsession) = send_follow_redirects(BASE_URL, &[], &proxy_mode).await?;
     let jsessionid = jsession.ok_or("JSESSIONID not found")?;
 
-    let check_url = format!("{}?user={}&pass={}", CHECK_URL, user, pass);
+    // Step 2: Authenticate
+    // FIX: user and pass are percent-encoded to prevent query parameter injection.
+    let check_url = format!(
+        "{}?user={}&pass={}",
+        CHECK_URL,
+        url_encode(user),
+        url_encode(pass),
+    );
     let cookie    = format!("JSESSIONID={}", jsessionid);
     let (body, _) = send_follow_redirects(
-        &check_url, &[("Cookie", cookie)], &proxy_mode,
+        &check_url,
+        &[("Cookie", cookie)],
+        &proxy_mode,
     ).await?;
 
     let (html, _, _) = SHIFT_JIS.decode(&body);
@@ -482,7 +367,6 @@ async fn scrape_inner(
             Some(f) => users.into_iter().filter(|u| f.matches(u)).collect(),
             None    => users,
         };
-        // Return None instead of Some([]) when all users are filtered out
         if filtered.is_empty() { None } else { Some(filtered) }
     });
 
@@ -506,7 +390,7 @@ pub async fn scrape(
     user: &str,
     pass: &str,
     opts: ScrapeOptions,
-) -> Result<ScrapeResult, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ScrapeResult, BoxError> {
     scrape_inner(user, pass, opts, ProxyMode::Auto).await
 }
 
@@ -517,11 +401,6 @@ pub async fn scrape_with_proxy(
     pass:      &str,
     proxy_uri: &str,
     opts:      ScrapeOptions,
-) -> Result<ScrapeResult, Box<dyn std::error::Error + Send + Sync>> {
-    let mode = if proxy_uri.is_empty() {
-        ProxyMode::Direct
-    } else {
-        ProxyMode::Manual(proxy_uri.to_string())
-    };
-    scrape_inner(user, pass, opts, mode).await
+) -> Result<ScrapeResult, BoxError> {
+    scrape_inner(user, pass, opts, ProxyMode::from_option(Some(proxy_uri))).await
 }

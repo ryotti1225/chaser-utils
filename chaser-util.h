@@ -38,6 +38,15 @@
  * -----------------------------------------------------------------
  *
  *   All strings are UTF-8 / null-terminated.
+ *
+ * -----------------------------------------------------------------
+ * Error codes (CScrapeResult::error_code)
+ * -----------------------------------------------------------------
+ *
+ *   0  success
+ *   1  scrape / network error  (see scraper_last_error())
+ *   2  invalid argument        (NULL user, pass, or proxy_uri)
+ *   3  internal panic          (should never happen; please report)
  */
 
 #pragma once
@@ -54,9 +63,9 @@ extern "C" {
 typedef struct {
     unsigned int  room;
     unsigned int  max_connections;
-    char*         map_display;     /* "可" or "否" */
+    char*         map_display;
     char*         public_date;
-    char*         patrol;          /* "有" or "×" */
+    char*         patrol;
     char*         remarks;
 } CRoomInfo;
 
@@ -67,14 +76,21 @@ typedef struct {
     unsigned int  state;
 } CLoggedInUser;
 
+/**
+ * Heap-allocated scrape result returned by scraper_scrape*().
+ *
+ * IMPORTANT: the two *_cap fields are INTERNAL bookkeeping used by
+ * scraper_free_result().  Do NOT read, write, or depend on their values.
+ * Their layout may change between releases.
+ */
 typedef struct {
     CRoomInfo*      rooms;
     size_t          rooms_len;
-    size_t          rooms_cap;     /* internal -- do not modify */
+    size_t          rooms_cap;     /* INTERNAL — do not use */
     CLoggedInUser*  users;         /* NULL = no logged-in users */
     size_t          users_len;     /* 0    = no logged-in users */
-    size_t          users_cap;     /* internal -- do not modify */
-    unsigned int    error_code;    /* 0 = success */
+    size_t          users_cap;     /* INTERNAL — do not use */
+    unsigned int    error_code;    /* 0=success 1=error 2=bad arg 3=panic */
 } CScrapeResult;
 
 /* ================================================================
@@ -95,7 +111,7 @@ typedef struct {
     unsigned int  min_max_conn;
     unsigned int  max_max_conn_enabled;
     unsigned int  max_max_conn;
-    const char*   map_display;            /* NULL = no filter */
+    const char*   map_display;
     const char*   public_date;
     const char*   public_date_contains;
     const char*   patrol;
@@ -110,7 +126,7 @@ typedef struct {
     unsigned int  order_min;
     unsigned int  order_max_enabled;
     unsigned int  order_max;
-    const char*   username;               /* NULL = no filter */
+    const char*   username;
     const char*   username_contains;
     unsigned int  room_enabled;
     unsigned int  room;
@@ -135,11 +151,12 @@ typedef struct {
  *   3. macOS System Configuration (macOS only)
  *   4. Direct connection
  *
- * @param user        Login username (UTF-8, null-terminated)
- * @param pass        Login password (UTF-8, null-terminated)
- * @param room_filter Room filter, or NULL for no filter
- * @param user_filter User filter, or NULL for no filter
- * @return            Must be freed with scraper_free_result()
+ * @param user        Login username (UTF-8, null-terminated).  MUST NOT be NULL.
+ * @param pass        Login password (UTF-8, null-terminated).  MUST NOT be NULL.
+ * @param room_filter Room filter, or NULL for no filter.
+ * @param user_filter User filter, or NULL for no filter.
+ * @return            Heap-allocated result; free with scraper_free_result().
+ *                    Never returns NULL.  Check error_code on the result.
  */
 CScrapeResult* scraper_scrape(
     const char*        user,
@@ -150,14 +167,15 @@ CScrapeResult* scraper_scrape(
 
 /**
  * Scrapes with a manually specified proxy.
- * Use this on Android or other environments where auto-detection is unavailable.
  *
- * @param user        Login username (UTF-8, null-terminated)
- * @param pass        Login password (UTF-8, null-terminated)
- * @param proxy_uri   e.g. "http://192.168.1.1:8080"; pass "" for direct connection
- * @param room_filter Room filter, or NULL for no filter
- * @param user_filter User filter, or NULL for no filter
- * @return            Must be freed with scraper_free_result()
+ * @param user        Login username (UTF-8, null-terminated).  MUST NOT be NULL.
+ * @param pass        Login password (UTF-8, null-terminated).  MUST NOT be NULL.
+ * @param proxy_uri   e.g. "http://192.168.1.1:8080"; pass "" for direct connection.
+ *                    MUST NOT be NULL.
+ * @param room_filter Room filter, or NULL for no filter.
+ * @param user_filter User filter, or NULL for no filter.
+ * @return            Heap-allocated result; free with scraper_free_result().
+ *                    Never returns NULL.  Check error_code on the result.
  */
 CScrapeResult* scraper_scrape_with_proxy(
     const char*        user,
@@ -168,7 +186,7 @@ CScrapeResult* scraper_scrape_with_proxy(
 );
 
 /**
- * Frees a CScrapeResult. Must always be called. Passing NULL is a no-op.
+ * Frees a CScrapeResult.  Must always be called.  Passing NULL is a no-op.
  */
 void scraper_free_result(CScrapeResult* result);
 
@@ -231,7 +249,7 @@ struct LoggedInUser {
 };
 
 struct ScrapeResult {
-    std::optional<std::vector<LoggedInUser>> logged_in_users; ///< nullopt = no users
+    std::optional<std::vector<LoggedInUser>> logged_in_users;
     std::vector<RoomInfo>                    rooms;
 };
 
@@ -303,7 +321,7 @@ struct UserFilter {
 /* ---- Internal conversion helper ---- */
 
 inline ScrapeResult convert(CScrapeResult* raw) {
-    if (!raw) throw std::runtime_error("null result");
+    if (!raw) throw std::runtime_error("scraper returned NULL (should never happen)");
     if (raw->error_code != 0) {
         std::string msg = scraper_last_error();
         scraper_free_result(raw);
