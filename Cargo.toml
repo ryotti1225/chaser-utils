@@ -2,14 +2,19 @@
 name = "chaser-util"
 version = "0.1.0"
 edition = "2021"
+description = "CHaser Online MeetingPlace / game-server scraper with C FFI, proxy support, and real-time map polling"
+license = "MIT"
+repository = "https://github.com/ryotti1225/chaser-utils"
+homepage = "https://github.com/ryotti1225/chaser-utils"
+documentation = "https://docs.rs/chaser-util"
+readme = "README.md"
+keywords = ["chaser", "scraper", "game", "ffi", "proxy"]
+categories = ["api-bindings", "network-programming", "web-programming::http-client"]
+exclude = ["target/*", "src/main.rs"]
 
 [lib]
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
-
-[[bin]]
-name = "chaser-util"
-path = "src/main.rs"
 
 [profile.dev]
 split-debuginfo = "packed"
